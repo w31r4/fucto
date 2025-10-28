@@ -63,10 +63,21 @@ docker compose down    # 停止并清理
 ## 测试
 
 ```bash
-# 测试 API
+# 最小化 Chat Completions 调用（OpenAI 兼容格式）
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5", "messages": [{"role": "user", "content": "测试"}]}'
+  -d '{
+        "model": "gpt-5",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {"type": "text", "text": "说一句测试用的中文问候语。"}
+            ]
+          }
+        ],
+        "stream": false
+      }'
 
 # 测试 WebSocket
 uv run python websocket_example.py

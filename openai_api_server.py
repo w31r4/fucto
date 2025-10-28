@@ -9,12 +9,14 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Optional, List, Dict, Any, AsyncGenerator, Union, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
+from starlette.status import HTTP_400_BAD_REQUEST, HTTP_500_INTERNAL_SERVER_ERROR, HTTP_502_BAD_GATEWAY
 
 from cto_new_client import CtoNewClient, AuthError, ApiError
 
@@ -90,11 +92,41 @@ class CookieManager:
 cookie_manager = CookieManager(COOKIES_FILE)
 
 
+# ========== OpenAI 兼容辅助 ==========
+def build_openai_error(
+    message: str,
+    type_: str = "invalid_request_error",
+    param: Optional[str] = None,
+    code: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"message": message, "type": type_}
+    if param:
+        payload["param"] = param
+    if code:
+        payload["code"] = code
+    return {"error": payload}
+
+
+def openai_http_exception(
+    status_code: int,
+    message: str,
+    type_: str = "invalid_request_error",
+    param: Optional[str] = None,
+    code: Optional[str] = None,
+) -> HTTPException:
+    return HTTPException(status_code=status_code, detail=build_openai_error(message, type_, param, code))
+
+
 # 模型映射：将 OpenAI 模型名称映射到 CTO.NEW 的 adapter
 # ========== Pydantic Models ==========
+class MessageContentPart(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
 class Message(BaseModel):
     role: str
-    content: str
+    content: Union[str, List[MessageContentPart]]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -152,9 +184,65 @@ def count_tokens(text: str) -> int:
 
 def format_chat_history(messages: List[Message]) -> str:
     """将聊天历史格式化为单个字符串 prompt"""
-    # 这是个简化的实现。一个更好的实现应该根据模型对角色的要求来格式化。
-    # 例如，某些模型需要 "User: ...", "Assistant: ..."
-    return "\n".join([f"{msg.role}: {msg.content}" for msg in messages])
+    rendered_messages: List[str] = []
+    for index, msg in enumerate(messages):
+        content = render_message_content(msg.content, index)
+        rendered_messages.append(f"{msg.role}: {content}")
+    return "\n".join(rendered_messages)
+
+
+def render_message_content(content: Union[str, List[MessageContentPart]], message_index: int) -> str:
+    if isinstance(content, str):
+        return content
+
+    segments: List[str] = []
+    for part_index, part in enumerate(content):
+        if part.type != "text":
+            raise openai_http_exception(
+                HTTP_400_BAD_REQUEST,
+                f"Unsupported content part type '{part.type}'. Only 'text' is supported.",
+                param=f"messages[{message_index}].content[{part_index}].type",
+                code="unsupported_message_content_type",
+            )
+        segments.append(part.text)
+
+    return "".join(segments)
+
+
+# ========== 异常处理 ==========
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    first_error = exc.errors()[0] if exc.errors() else {}
+    loc = first_error.get("loc", [])
+    param = ".".join(str(part) for part in loc if part != "body") or None
+    message = first_error.get("msg", "Invalid request payload.")
+    code = first_error.get("type")
+    return JSONResponse(
+        status_code=HTTP_400_BAD_REQUEST,
+        content=build_openai_error(message, param=param, code=code),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict) and "error" in exc.detail:
+        content = exc.detail
+    else:
+        content = build_openai_error(str(exc.detail or ""))
+    return JSONResponse(status_code=exc.status_code, content=content)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"未处理异常: {exc}")
+    return JSONResponse(
+        status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+        content=build_openai_error(
+            "Internal server error.",
+            type_="server_error",
+            code="internal_error",
+        ),
+    )
 
 
 async def stream_ai_response(client: CtoNewClient, chat_id: str, model: str) -> AsyncGenerator[str, None]:
@@ -163,6 +251,15 @@ async def stream_ai_response(client: CtoNewClient, chat_id: str, model: str) -> 
     created_time = int(time.time())
 
     try:
+        role_chunk = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(role_chunk)}\n\n"
+
         async for content_chunk in client.stream_chat_response(chat_id):
             chunk = {
                 "id": stream_id,
@@ -236,9 +333,29 @@ async def chat_completions(req: Request, payload: ChatCompletionRequest):
 
         # 确定 adapter 并格式化 prompt
         adapter = MODEL_MAPPING.get(payload.model, DEFAULT_ADAPTER)
+        if not payload.messages:
+            raise openai_http_exception(
+                HTTP_400_BAD_REQUEST,
+                "messages must be a non-empty array.",
+                param="messages",
+                code="missing_required_field",
+            )
+        if payload.messages[-1].role != "user":
+            raise openai_http_exception(
+                HTTP_400_BAD_REQUEST,
+                "The last message must be from the user.",
+                param="messages",
+                code="invalid_message_role",
+            )
+
         prompt = format_chat_history(payload.messages)
-        if not prompt:
-            raise HTTPException(status_code=400, detail="No user message found")
+        if not prompt.strip():
+            raise openai_http_exception(
+                HTTP_400_BAD_REQUEST,
+                "At least one user message with content is required.",
+                param="messages",
+                code="invalid_message_content",
+            )
 
         # 创建聊天
         chat_id = await client.create_chat(prompt, adapter)
@@ -267,14 +384,30 @@ async def chat_completions(req: Request, payload: ChatCompletionRequest):
             ),
         )
 
+    except HTTPException:
+        raise
     except (AuthError, ApiError) as e:
-        raise HTTPException(status_code=500, detail=f"上游服务错误：{e}")
+        raise openai_http_exception(
+            HTTP_502_BAD_GATEWAY,
+            f"Upstream service error: {e}",
+            type_="server_error",
+            code="upstream_error",
+        )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise openai_http_exception(
+            HTTP_400_BAD_REQUEST,
+            str(e),
+            code="invalid_request",
+        )
     except Exception as e:
         # 捕获所有其他意外错误
         print(f"发生意外错误：{e}")
-        raise HTTPException(status_code=500, detail="服务器内部发生未知错误")
+        raise openai_http_exception(
+            HTTP_500_INTERNAL_SERVER_ERROR,
+            "Internal server error.",
+            type_="server_error",
+            code="internal_error",
+        )
 
 
 if __name__ == "__main__":
