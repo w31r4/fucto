@@ -97,8 +97,9 @@ uv run python websocket_example.py
 
 ### 性能优化
 
-- 使用 `httpx.AsyncClient` 替代 `requests`，避免阻塞事件循环
-- 连接池复用，减少连接开销
+- 使用 `curl-cffi` 的浏览器指纹模拟（impersonate）能力，绕过 TLS 指纹识别
+- 统一的浏览器指纹（User-Agent 与相关 headers）在整个会话中复用，减少风控触发概率
+- 连接池复用，减少重复握手开销
 - 使用 `tiktoken` 进行准确的 token 计算（如果可用）
 
 ## 故障排除

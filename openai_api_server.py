@@ -5,13 +5,12 @@ OpenAI 格式兼容的 API 服务器
 
 import asyncio
 import json
+import os
 import time
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, List, Dict, Any, AsyncGenerator, Union, Literal
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -38,6 +37,7 @@ MODEL_MAPPING = {
     "claude-sonnet-4-5": "ClaudeSonnet4_5",
 }
 DEFAULT_ADAPTER = "ClaudeSonnet4_5"
+PROXY_URL = os.getenv("PROXY_URL")  # 支持通过环境变量配置代理, e.g., "http://127.0.0.1:7890"
 
 
 # ========== 线程安全的 Cookie 管理器 ==========
@@ -160,18 +160,8 @@ class ChatCompletionResponse(BaseModel):
 
 
 # ========== FastAPI App & Lifecycle ==========
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 应用启动时
-    app.state.http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-    print("HTTPX 客户端已创建")
-    yield
-    # 应用关闭时
-    await app.state.http_client.aclose()
-    print("HTTPX 客户端已关闭")
-
-
-app = FastAPI(title="OpenAI Compatible API", version="1.1.0", lifespan=lifespan)
+# CtoNewClient 内部管理其网络会话，不再需要全局的 lifespan 管理器
+app = FastAPI(title="OpenAI Compatible API", version="1.2.0")
 
 
 # ========== 辅助函数 ==========
@@ -322,11 +312,9 @@ async def chat_completions(req: Request, payload: ChatCompletionRequest):
     OpenAI 兼容的聊天完成接口
     支持流式和非流式响应
     """
-    http_client: httpx.AsyncClient = req.app.state.http_client
-
     try:
         cookie = await cookie_manager.get_cookie()
-        client = CtoNewClient(cookie, http_client)
+        client = CtoNewClient(cookie, proxy=PROXY_URL)
 
         # 认证
         await client.authenticate()

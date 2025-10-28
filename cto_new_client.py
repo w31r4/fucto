@@ -1,11 +1,13 @@
 import asyncio
 import json
 import uuid
-from typing import AsyncGenerator, Dict, Any, Optional
+from typing import AsyncGenerator, Optional
 
-import httpx
+from curl_cffi import requests as cffi_requests
 import websockets
 from websockets.exceptions import ConnectionClosed
+
+from ua_utils import BrowserFingerprint
 
 
 # ========== 自定义异常 ==========
@@ -31,18 +33,28 @@ class ApiError(CtoNewError):
 class CtoNewClient:
     """
     与 cto.new 后端服务交互的异步客户端。
-    封装了认证、创建聊天和 WebSocket 通信。
+    使用 curl_cffi 模拟浏览器 TLS 指纹，并支持代理。
     """
 
     BASE_URL = "https://api.enginelabs.ai/engine-agent"
     CLERK_URL = "https://clerk.cto.new"
+    CLERK_API_VERSION = "2025-04-10"
+    CLERK_JS_VERSION = "5.102.0"
 
-    def __init__(self, cookie: str, client: httpx.AsyncClient):
+    def __init__(self, cookie: str, proxy: Optional[str] = None):
         self._cookie = cookie
-        self._client = client
         self._jwt: Optional[str] = None
         self._ws_user_token: Optional[str] = None
         self._session_id: Optional[str] = None
+        self._fingerprint = BrowserFingerprint.create()
+
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        # 使用 impersonate 模拟真实浏览器的 TLS 指纹，这是对抗指纹识别的关键
+        self._client = cffi_requests.AsyncSession(
+            impersonate="chrome120",
+            proxies=proxies,
+            timeout=30,
+        )
 
     async def _get_clerk_info(self):
         """获取 Clerk 会话信息"""
@@ -51,32 +63,25 @@ class CtoNewClient:
             "paginated": "true",
             "limit": "10",
             "offset": "0",
-            "__clerk_api_version": "2025-04-10",
-            "_clerk_js_version": "5.102.0",
+            "__clerk_api_version": self.CLERK_API_VERSION,
+            "_clerk_js_version": self.CLERK_JS_VERSION,
         }
-        headers = {
-            "accept": "application/json",
-            "cookie": self._cookie,
-            "origin": "https://cto.new",
-            "referer": "https://cto.new/",
-            "user-agent": "Mozilla/5.0",
-        }
+        # 使用 ua_utils 生成动态请求头
+        headers = self._fingerprint.build_headers(origin=self.CLERK_URL, referer=f"{self.CLERK_URL}/")
+        headers["cookie"] = self._cookie
 
         try:
             r = await self._client.get(url, headers=headers, params=params)
             r.raise_for_status()
             data = r.json()
 
-            # 使用与原始代码相同的直接访问方式
-            client_data = data["client"]
+            client_data = data.get("client", {})
             sessions = client_data.get("sessions", [])
             if not sessions:
                 raise AuthError("Clerk 响应中没有可用的 session")
 
             session = sessions[0]
             self._session_id = client_data.get("last_active_session_id") or session.get("id")
-
-            # 尽量从多个可能的字段中获取 WebSocket token
             self._ws_user_token = (
                 session.get("ws_user_token") or session.get("wsToken") or session.get("user", {}).get("id")
             )
@@ -84,11 +89,11 @@ class CtoNewClient:
             if not self._session_id or not self._ws_user_token:
                 raise AuthError("无法在 Clerk 响应中找到 session_id 或 user_id")
 
-        except httpx.HTTPStatusError as e:
-            body = e.response.text[:200]
-            raise AuthError(f"获取 Clerk 信息失败：{e.response.status_code} - {body}") from e
+        except cffi_requests.errors.RequestsError as e:
+            body = e.response.text[:200] if e.response else "No response"
+            raise AuthError(f"获取 Clerk 信息失败: {e} - {body}") from e
         except (KeyError, IndexError) as e:
-            raise AuthError(f"解析 Clerk 响应失败：{e}") from e
+            raise AuthError(f"解析 Clerk 响应失败: {e}") from e
 
     async def _refresh_jwt(self):
         """刷新 JWT"""
@@ -97,25 +102,21 @@ class CtoNewClient:
 
         url = (
             f"{self.CLERK_URL}/v1/client/sessions/{self._session_id}/tokens"
-            "?__clerk_api_version=2025-04-10&_clerk_js_version=5.101.1"
+            f"?__clerk_api_version={self.CLERK_API_VERSION}&_clerk_js_version={self.CLERK_JS_VERSION}"
         )
-        headers = {
-            "accept": "application/json",
-            "cookie": self._cookie,
-            "origin": "https://cto.new",
-            "referer": "https://cto.new/",
-            "user-agent": "Mozilla/5.0",
-            "content-type": "application/x-www-form-urlencoded",
-        }
+        headers = self._fingerprint.build_headers(origin=self.CLERK_URL, referer=f"{self.CLERK_URL}/")
+        headers["cookie"] = self._cookie
+        headers["content-type"] = "application/x-www-form-urlencoded"
+
         try:
-            r = await self._client.post(url, headers=headers, data={}, follow_redirects=True)
+            r = await self._client.post(url, headers=headers, data="", follow_redirects=True)
             r.raise_for_status()
             self._jwt = r.json().get("jwt")
             if not self._jwt:
                 raise AuthError("JWT 为空")
-        except httpx.HTTPStatusError as e:
-            body = e.response.text[:200]
-            raise AuthError(f"刷新 JWT 失败：{e.response.status_code} - {body}") from e
+        except cffi_requests.errors.RequestsError as e:
+            body = e.response.text[:200] if e.response else "No response"
+            raise AuthError(f"刷新 JWT 失败: {e} - {body}") from e
 
     async def authenticate(self):
         """执行完整的认证流程"""
@@ -129,20 +130,16 @@ class CtoNewClient:
 
         chat_id = str(uuid.uuid4())
         url = f"{self.BASE_URL}/chat"
-        headers = {
-            "authorization": f"Bearer {self._jwt}",
-            "accept": "application/json",
-            "origin": "https://cto.new",
-            "referer": "https://cto.new/",
-        }
+        headers = self._fingerprint.build_headers(origin="https://cto.new", referer="https://cto.new/")
+        headers["authorization"] = f"Bearer {self._jwt}"
         data = {"prompt": prompt, "chatHistoryId": chat_id, "adapterName": adapter}
 
         try:
             r = await self._client.post(url, headers=headers, json=data, follow_redirects=True)
             r.raise_for_status()
             return chat_id
-        except httpx.HTTPStatusError as e:
-            raise ApiError(f"创建聊天失败：{e.response.status_code}") from e
+        except cffi_requests.errors.RequestsError as e:
+            raise ApiError(f"创建聊天失败: {e}") from e
 
     async def stream_chat_response(self, chat_id: str) -> AsyncGenerator[str, None]:
         """通过 WebSocket 流式获取 AI 响应"""
@@ -155,7 +152,10 @@ class CtoNewClient:
         )
 
         try:
-            async with websockets.connect(ws_url, max_size=2**20) as ws:  # 设置合理的 max_size
+            # 注意：websockets 不通过 curl_cffi，所以代理需要单独配置（如果需要）
+            # 但通常 WebSocket 的指纹检测没有 HTTP 严格
+            ws_headers = self._fingerprint.build_ws_headers(origin="https://cto.new", referer="https://cto.new/")
+            async with websockets.connect(ws_url, max_size=2**20, extra_headers=ws_headers) as ws:
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
@@ -170,14 +170,10 @@ class CtoNewClient:
                         elif data.get("type") == "state" and not data["state"].get("inProgress"):
                             break
                     except (json.JSONDecodeError, KeyError):
-                        # 忽略无法解析或格式不符的消息
                         continue
                     except asyncio.TimeoutError:
-                        # 如果 30 秒没有收到消息，主动关闭
                         break
-        except (ConnectionClosed, asyncio.TimeoutError) as e:
-            # 连接关闭或超时，正常结束
+        except (ConnectionClosed, asyncio.TimeoutError):
             pass
         except Exception as e:
-            # 其他 WebSocket 异常
-            raise ApiError(f"WebSocket 通信错误：{e}") from e
+            raise ApiError(f"WebSocket 通信错误: {e}") from e

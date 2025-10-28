@@ -2,6 +2,8 @@ fastapi==0.115.0
 uvicorn==0.32.0
 websockets==14.1
 pydantic==2.10.1
-httpx==0.27.0
+# httpx==0.27.0 # 已被 curl-cffi 替代
+curl-cffi==0.6.4
 # tiktoken 是可选的，用于更准确地计算 token。如果不需要，可以注释掉。
 tiktoken==0.7.0
+fake-useragent==1.5.1
