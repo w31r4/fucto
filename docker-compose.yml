@@ -1,0 +1,9 @@
+services:
+  fucto:
+    build: .
+    image: fucto:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./cookies:/app/cookies:ro
+    restart: unless-stopped
