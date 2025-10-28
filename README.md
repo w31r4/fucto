@@ -73,6 +73,17 @@ uv run python websocket_example.py
 ```
 
 
+## 支持的模型
+
+当前通过 `/v1/models` 会返回以下 OpenAI 兼容模型名称，并映射到 CTO.NEW 的适配器：
+
+| OpenAI 模型名            | CTO.NEW Adapter |
+|-------------------------|-----------------|
+| `gpt-5`                 | `GPT5`          |
+| `claude-sonnet-4-5`     | `ClaudeSonnet4_5` |
+
+如需扩展，修改 `openai_api_server.py` 中的 `MODEL_MAPPING`。
+
 ### 性能优化
 
 - 使用 `httpx.AsyncClient` 替代 `requests`，避免阻塞事件循环
