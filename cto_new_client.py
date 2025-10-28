@@ -91,9 +91,9 @@ class CtoNewClient:
 
         except cffi_requests.errors.RequestsError as e:
             body = e.response.text[:200] if e.response else "No response"
-            raise AuthError(f"获取 Clerk 信息失败: {e} - {body}") from e
+            raise AuthError(f"获取 Clerk 信息失败：{e} - {body}") from e
         except (KeyError, IndexError) as e:
-            raise AuthError(f"解析 Clerk 响应失败: {e}") from e
+            raise AuthError(f"解析 Clerk 响应失败：{e}") from e
 
     async def _refresh_jwt(self):
         """刷新 JWT"""
@@ -116,7 +116,7 @@ class CtoNewClient:
                 raise AuthError("JWT 为空")
         except cffi_requests.errors.RequestsError as e:
             body = e.response.text[:200] if e.response else "No response"
-            raise AuthError(f"刷新 JWT 失败: {e} - {body}") from e
+            raise AuthError(f"刷新 JWT 失败：{e} - {body}") from e
 
     async def authenticate(self):
         """执行完整的认证流程"""
@@ -139,7 +139,7 @@ class CtoNewClient:
             r.raise_for_status()
             return chat_id
         except cffi_requests.errors.RequestsError as e:
-            raise ApiError(f"创建聊天失败: {e}") from e
+            raise ApiError(f"创建聊天失败：{e}") from e
 
     async def stream_chat_response(self, chat_id: str) -> AsyncGenerator[str, None]:
         """通过 WebSocket 流式获取 AI 响应"""
@@ -176,4 +176,4 @@ class CtoNewClient:
         except (ConnectionClosed, asyncio.TimeoutError):
             pass
         except Exception as e:
-            raise ApiError(f"WebSocket 通信错误: {e}") from e
+            raise ApiError(f"WebSocket 通信错误：{e}") from e
