@@ -107,26 +107,42 @@ def _detect_platform(user_agent: str) -> str:
     return '"Windows"'
 
 
-def _infer_fetch_site(origin: Optional[str], referer: Optional[str]) -> str:
-    if not origin and not referer:
-        return "none"
-
-    def _host(url: Optional[str]) -> Optional[str]:
-        if not url:
+def _infer_fetch_site(origin: Optional[str], referer: Optional[str], target_url: Optional[str]) -> str:
+    def _normalize_host(value: Optional[str]) -> Optional[str]:
+        if not value:
             return None
-        return urlparse(url).netloc or None
+        parsed = urlparse(value) if "://" in value else urlparse(f"https://{value}")
+        return (parsed.netloc or parsed.path or "").lower() or None
 
-    origin_host = _host(origin)
-    referer_host = _host(referer)
-    if origin_host and referer_host:
-        if origin_host == referer_host:
+    def _site(host: Optional[str]) -> Optional[str]:
+        if not host:
+            return None
+        parts = host.split(".")
+        if len(parts) >= 2:
+            return ".".join(parts[-2:])
+        return host
+
+    origin_host = _normalize_host(origin)
+    referer_host = _normalize_host(referer)
+    target_host = _normalize_host(target_url)
+
+    if target_host and origin_host:
+        if origin_host == target_host:
             return "same-origin"
-        origin_suffix = origin_host.split(".")[-2:]
-        referer_suffix = referer_host.split(".")[-2:]
-        if origin_suffix == referer_suffix:
+        if _site(origin_host) and _site(origin_host) == _site(target_host):
             return "same-site"
-    if origin_host or referer_host:
         return "cross-site"
+
+    if target_host and referer_host:
+        if referer_host == target_host:
+            return "same-origin"
+        if _site(referer_host) and _site(referer_host) == _site(target_host):
+            return "same-site"
+        return "cross-site"
+
+    if origin_host or referer_host:
+        return "same-origin" if origin_host == referer_host else "cross-site"
+
     return "none"
 
 
@@ -156,11 +172,13 @@ class BrowserFingerprint:
 
     def build_headers(
         self,
+        target_url: Optional[str] = None,
         referer: Optional[str] = None,
         origin: Optional[str] = None,
         additional_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
         return get_dynamic_headers(
+            target_url=target_url,
             referer=referer,
             origin=origin,
             browser_type=self.browser_type,
@@ -192,6 +210,7 @@ class BrowserFingerprint:
 
 # 通用 UserAgent headers 生成函数
 def get_dynamic_headers(
+    target_url: Optional[str] = None,
     referer: Optional[str] = None,
     origin: Optional[str] = None,
     browser_type: Optional[str] = None,
@@ -273,7 +292,7 @@ def get_dynamic_headers(
                 "sec-ch-ua-platform": _detect_platform(user_agent),
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": _infer_fetch_site(origin, referer),
+                "Sec-Fetch-Site": _infer_fetch_site(origin, referer, target_url),
             }
         )
 
