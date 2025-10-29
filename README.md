@@ -8,6 +8,17 @@
 - `openai_api_server.py` - FastAPI 服务器，提供 `/v1/chat/completions` 接口
 - `websocket_example.py` - 命令行测试工具
 
+## 认证流程概述
+
+服务启动后，每次处理请求都会自动执行与前端一致的认证步骤：
+
+1. 访问 Clerk 的 `/v1/client` 接口，获取 `last_active_session_id`、`last_active_token` 以及最近活跃的组织信息。
+2. 根据需要回补 `/v1/me/organization_memberships`，确保能够拿到可用的 WebSocket token 和组织 ID。
+3. 调用 `/v1/client/sessions/{session}/touch`，将当前组织 ID 写回，并换取最新的会话 JWT。
+4. 最后请求 `/v1/client/sessions/{session}/tokens` 生成正式的 Bearer token，用于后续调用 CTO.NEW 的私有接口。
+
+整个流程通过 `curl-cffi` 指纹模拟加上统一的 `BrowserFingerprint`，确保所有 HTTP 与 WebSocket 请求使用同一套 headers 与 TLS 指纹，最大程度贴近真实浏览器。
+
 ## 快速部署
 
 ### 使用 uv (推荐)
@@ -98,7 +109,8 @@ uv run python websocket_example.py
 ### 性能优化
 
 - 使用 `curl-cffi` 的浏览器指纹模拟（impersonate）能力，绕过 TLS 指纹识别
-- 统一的浏览器指纹（User-Agent 与相关 headers）在整个会话中复用，减少风控触发概率
+- 统一的浏览器指纹（User-Agent 与相关 headers）在整个会话中复用，同时涵盖 Clerk 认证、JWT 刷新与 WebSocket 握手
+- 自动执行 `/client` → `/touch` → `/tokens` 的会话刷新流程，确保 JWT 始终有效
 - 连接池复用，减少重复握手开销
 - 使用 `tiktoken` 进行准确的 token 计算（如果可用）
 
